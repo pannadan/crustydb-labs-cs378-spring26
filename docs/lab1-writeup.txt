@@ -1,0 +1,16 @@
+The main design decision in this lab was how to structure the heap page layout. 
+I did a slotted-page architecture with an 8-byte fixed header followed by 6-byte slot entries per value. 
+Each slot stores the offset and length of the value within the page, allowing values to be stored in arbitrary order within the data region. 
+This ensures that slot IDs remain stable even if the physical layout of values changes.
+
+For insertions, I packed values from the end of the page downward and grew the slot directory from the beginning upward. 
+This simplifies space management and avoids overlapping regions. 
+I ensured that the lowest available slot ID is reused when inserting after deletion.
+I also implemented compaction of the page to reclaim space after deletions so that inserting a value of the same or greater size after deletion would succeed. 
+The compaction function repacks "live values" (non-deleted in use ones) and updates their offsets without changing slot IDs.
+
+For iteration, I implemented a consuming iterator that walks through slots in ascending slot ID order and yields only valid (non-deleted) entries. 
+This keeps iteration behavior logically aligned with slot ordering rather than physical byte layout.
+
+I spent about 5 hours on the assignment from getting more familiar with Rust again and designing the system to actually building it.
+I like that the lab mirrors what we learn about in the course. Compared to a lot of my other classes where the lab content doesn't match the lecture content this well, this is a nice surprise to work on.
