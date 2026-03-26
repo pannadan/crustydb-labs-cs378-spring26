@@ -2,6 +2,7 @@ use crate::page::Page;
 use common::prelude::*;
 use common::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -50,14 +51,22 @@ impl HeapFile {
                 )))
             }
         };
-        panic!("TODO milestone hs");
-    }
+
+        Ok(HeapFile {
+            file: Arc::new(RwLock::new(file)),
+            container_id,
+            read_count: AtomicU16::new(0),
+            write_count: AtomicU16::new(0),
+        })
+    }    
 
     /// Return the number of pages for this HeapFile.
     /// Return type is PageId (alias for another type) as we cannot have more
     /// pages than PageId can hold.
     pub fn num_pages(&self) -> PageId {
-        panic!("TODO milestone hs");
+        let file = self.file.read().unwrap();
+        let len = file.metadata().unwrap().len();
+        (len / PAGE_SIZE as u64) as PageId
     }
 
     /// Read the page from the file.
@@ -69,7 +78,29 @@ impl HeapFile {
         {
             self.read_count.fetch_add(1, Ordering::Relaxed);
         }
-        panic!("TODO milestone hs");
+        
+        if pid >= self.num_pages() {
+            return Err(CrustyError::CrustyError("Invalid pid given".to_owned()));
+        }
+
+        let mut file = self.file.write().unwrap();
+        let page_offset = (pid as u64) * (PAGE_SIZE as u64);
+        file.seek(SeekFrom::Start(page_offset)).map_err(|e| {
+            CrustyError::CrustyError(format!(
+                "Failed to seek to page offset {}: {:?}",
+                page_offset, e
+            ))
+         })?;
+
+         let mut data: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+         file.read_exact(&mut data).map_err(|e| {
+            CrustyError::CrustyError(format!(
+                "Failed to read page data at offset {}: {:?}",
+                page_offset, e
+            ))
+        })?;
+
+        Ok(Page::from_bytes(data))
     }
 
     /// Take a page and write it to the underlying file.
@@ -85,7 +116,25 @@ impl HeapFile {
         {
             self.write_count.fetch_add(1, Ordering::Relaxed);
         }
-        panic!("TODO milestone hs");
+
+        let pid = page.get_page_id();
+        let num_pages = self.num_pages();
+        if pid > num_pages {
+            return Err(CrustyError::CrustyError("Invalid pid".to_owned()));
+        }
+
+        let mut file = self.file.write().unwrap();
+        let mut buf_writer = BufWriter::new(&mut *file);
+
+        // finding page offset and writing and flushing the data to file
+        let page_offset = (pid as u64) * (PAGE_SIZE as u64);
+        buf_writer.seek(SeekFrom::Start(page_offset)).map_err(|e| {
+            CrustyError::CrustyError("Failed to seek to page offset".to_owned())})?;
+        buf_writer.write_all(&page.data).map_err(|e| {
+            CrustyError::CrustyError("Failed to write page data at offset".to_owned())})?;
+        buf_writer.flush().map_err(|e| {
+            CrustyError::CrustyError("Failed to flush data to file".to_owned())})?;
+        Ok(())
     }
 }
 

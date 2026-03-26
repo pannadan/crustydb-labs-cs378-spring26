@@ -1,0 +1,17 @@
+Design Decisions: 
+- Not really anything this lab it was mostly implementing the traits and functions that were listed out already
+- I didn't make any helper functions or anything to help me in this lab
+
+How long I spent:
+- Probably about 10 hours on this lab, significantly longer than the last lab.
+
+Challenges:
+- The parts that were more difficult were the Storage Manager trait implementation for sure
+- I struggled with understanding how the structure of the HeapFile and Container system meshed fully
+- but my solution looks to have figured it out.
+- I had to figure out File I/O and that was a little challenge
+- Reading through the project handout and figuring out the relationship of Storage Managers and Containers 
+- to the actual database and how things are stored took me some time but once I got it, it cleared up some roadblocks
+- like create_container() and those related functions.
+
+I am taking 1 slip/late day on this project.
