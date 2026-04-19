@@ -5,7 +5,7 @@ use common::bytecode_expr::ByteCodeExpr;
 use common::{CrustyError, Field, TableSchema, Tuple};
 use std::collections::HashMap;
 
-/// Hash equi-join implementation. (You can add any other fields that you think are neccessary)
+/// Hash equi-join implementation.
 pub struct HashEqJoin {
     // Static objects (No need to reset on close)
     managers: &'static Managers,
@@ -16,19 +16,24 @@ pub struct HashEqJoin {
     right_expr: ByteCodeExpr,
     left_child: Box<dyn OpIterator>,
     right_child: Box<dyn OpIterator>,
+
     // States (Need to reset on close)
-    // todo!("Your code here")
+    open: bool,
+    hash_table: HashMap<Field, Vec<Tuple>>,
+    current_right: Option<Tuple>,
+    current_left_matches: Vec<Tuple>,
+    current_match_idx: usize,
 }
 
 impl HashEqJoin {
-    /// NestedLoopJoin constructor. Creates a new node for a nested-loop join.
+    /// HashEqJoin constructor. Creates a new node for a hash equi-join.
     ///
     /// # Arguments
     ///
     /// * `left_expr` - ByteCodeExpr for the left field in join condition.
     /// * `right_expr` - ByteCodeExpr for the right field in join condition.
     /// * `left_child` - Left child of join operator.
-    /// * `right_child` - Left child of join operator.
+    /// * `right_child` - Right child of join operator.
     pub fn new(
         managers: &'static Managers,
         schema: TableSchema,
@@ -37,7 +42,19 @@ impl HashEqJoin {
         left_child: Box<dyn OpIterator>,
         right_child: Box<dyn OpIterator>,
     ) -> Self {
-        todo!("Your code here")
+        Self {
+            managers,
+            schema,
+            left_expr,
+            right_expr,
+            left_child,
+            right_child,
+            open: false,
+            hash_table: HashMap::new(),
+            current_right: None,
+            current_left_matches: Vec::new(),
+            current_match_idx: 0,
+        }
     }
 }
 
@@ -48,19 +65,83 @@ impl OpIterator for HashEqJoin {
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            self.left_child.open()?;
+            self.right_child.open()?;
+
+            self.hash_table.clear();
+            self.current_right = None;
+            self.current_left_matches.clear();
+            self.current_match_idx = 0;
+
+            while let Some(left_tuple) = self.left_child.next()? {
+                let key = self.left_expr.eval(&left_tuple);
+                self.hash_table.entry(key).or_default().push(left_tuple);
+            }
+
+            self.open = true;
+        }
+        Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        loop {
+            if self.current_match_idx < self.current_left_matches.len() {
+                let left_tuple = self.current_left_matches[self.current_match_idx].clone();
+                self.current_match_idx += 1;
+
+                if let Some(right_tuple) = self.current_right.as_ref() {
+                    return Ok(Some(left_tuple.merge(right_tuple)));
+                }
+            }
+
+            match self.right_child.next()? {
+                Some(right_tuple) => {
+                    let key = self.right_expr.eval(&right_tuple);
+                    self.current_right = Some(right_tuple);
+                    self.current_match_idx = 0;
+
+                    if let Some(matches) = self.hash_table.get(&key) {
+                        self.current_left_matches = matches.clone();
+
+                        if !self.current_left_matches.is_empty() {
+                            continue;
+                        }
+                    } else {
+                        self.current_left_matches.clear();
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.close()?;
+        self.right_child.close()?;
+        self.open = false;
+        self.hash_table.clear();
+        self.current_right = None;
+        self.current_left_matches.clear();
+        self.current_match_idx = 0;
+        let _ = self.managers;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        self.right_child.rewind()?;
+        self.current_right = None;
+        self.current_left_matches.clear();
+        self.current_match_idx = 0;
+        Ok(())
     }
 
     fn get_schema(&self) -> &TableSchema {

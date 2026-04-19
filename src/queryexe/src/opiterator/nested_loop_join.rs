@@ -4,7 +4,7 @@ use common::bytecode_expr::ByteCodeExpr;
 use common::datatypes::compare_fields;
 use common::{BooleanOp, CrustyError, TableSchema, Tuple};
 
-/// Nested loop join implementation. (You can add any other fields that you think are neccessary)
+/// Nested loop join implementation.
 pub struct NestedLoopJoin {
     // Parameters (No need to reset on close)
     schema: TableSchema,
@@ -12,11 +12,11 @@ pub struct NestedLoopJoin {
     left_expr: ByteCodeExpr,
     right_expr: ByteCodeExpr,
     left_child: Box<dyn OpIterator>,
-    right_child: Box<dyn OpIterator>
+    right_child: Box<dyn OpIterator>,
 
-    // TODO: Add any other fields that you need to
-    // maintain operator state here
-
+    // States (Need to reset on close)
+    open: bool,
+    current_left: Option<Tuple>,
 }
 
 impl NestedLoopJoin {
@@ -37,7 +37,16 @@ impl NestedLoopJoin {
         right_child: Box<dyn OpIterator>,
         schema: TableSchema,
     ) -> Self {
-        todo!("Your code here")
+        Self {
+            schema,
+            op,
+            left_expr,
+            right_expr,
+            left_child,
+            right_child,
+            open: false,
+            current_left: None,
+        }
     }
 }
 
@@ -48,20 +57,55 @@ impl OpIterator for NestedLoopJoin {
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            self.left_child.open()?;
+            self.right_child.open()?;
+            self.current_left = self.left_child.next()?;
+            self.open = true;
+        }
+        Ok(())
     }
 
     /// Calculates the next tuple for a nested loop join.
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        while let Some(left_tuple) = self.current_left.as_ref() {
+            while let Some(right_tuple) = self.right_child.next()? {
+                let left_val = self.left_expr.eval(left_tuple);
+                let right_val = self.right_expr.eval(&right_tuple);
+
+                if compare_fields(self.op, &left_val, &right_val) {
+                    return Ok(Some(left_tuple.merge(&right_tuple)));
+                }
+            }
+
+            self.right_child.rewind()?;
+            self.current_left = self.left_child.next()?;
+        }
+
+        Ok(None)
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.close()?;
+        self.right_child.close()?;
+        self.current_left = None;
+        self.open = false;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        self.left_child.rewind()?;
+        self.right_child.rewind()?;
+        self.current_left = self.left_child.next()?;
+        Ok(())
     }
 
     /// return schema of the result

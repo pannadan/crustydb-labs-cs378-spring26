@@ -1,0 +1,16 @@
+Solutions:
+
+For nested-loop join, I implemented the standard approach using two iterators. 
+I keep track of the current left tuple in state, iterate through all tuples on the right, and compare the evaluated expressions using the given operator before merging. 
+When the right side is exhausted, I rewind it and move to the next left tuple.
+
+For hash-join, I used a build-and-probe approach. 
+I built a hash map on the left child during open(), using the evaluated join key as the map key and storing matching tuples in a vector to handle duplicates. 
+In next(), I iterate over the right child and probe the map. Since there can be multiple matches per key, I store both the current match vector and an index as state so I can return one joined tuple at a time across multiple calls to next().
+
+For aggregate.rs, I used a hashmap to store unique group-by field values as keys, with the aggregate values stored as the map values. Each tuple is processed by evaluating both the group-by expressions and aggregation expressions, then either inserting into a new group or merging into an existing one. 
+For AVG, I expanded it into two internal slots (sum and count) and made sure to convert values to decimal early to avoid integer division issues. After processing all tuples, I materialized the results into a vector and sorted them by group key to ensure deterministic output. An index is maintained to track position in the result vector for next().
+
+I'd say I spent about 7–8 hours on this lab. 
+The joins were fairly straightforward, but the aggregation logic—especially handling AVG correctly—took the most time to get right.
+I thought the lab was well structured.

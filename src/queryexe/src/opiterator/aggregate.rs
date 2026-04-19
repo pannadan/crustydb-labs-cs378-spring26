@@ -6,7 +6,7 @@ use common::{AggOp, CrustyError, Field, TableSchema, Tuple};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 
-/// Aggregate operator. (You can add any other fields that you think are neccessary)
+/// Aggregate operator.
 pub struct Aggregate {
     // Static objects (No need to reset on close)
     managers: &'static Managers,
@@ -24,9 +24,17 @@ pub struct Aggregate {
     child: Box<dyn OpIterator>,
     /// If true, then the operator will be rewinded in the future.
     will_rewind: bool,
-    
+
     // States (Need to reset on close)
-    // todo!("Your code here")
+    open: bool,
+    /// Maps group key -> internal aggregate state.
+    map: HashMap<Vec<Field>, Vec<Field>>,
+    /// Internal ops where each AVG becomes [AVG, COUNT].
+    ops_other: Vec<AggOp>,
+    /// Materialized results for iteration.
+    results: Vec<Tuple>,
+    /// Current index into results.
+    index: usize,
 }
 
 impl Aggregate {
@@ -39,56 +47,198 @@ impl Aggregate {
         child: Box<dyn OpIterator>,
     ) -> Self {
         assert!(ops.len() == agg_expr.len());
-        todo!("Your code here")
+        Self {
+            managers,
+            schema,
+            groupby_expr,
+            agg_expr,
+            ops,
+            child,
+            will_rewind: false,
+            open: false,
+            map: HashMap::new(),
+            ops_other: Vec::new(),
+            results: Vec::new(),
+            index: 0,
+        }
     }
 
     fn merge_fields(op: AggOp, field_val: &Field, acc: &mut Field) -> Result<(), CrustyError> {
         match op {
             AggOp::Count => *acc = (acc.clone() + Field::Int(1))?,
             AggOp::Max => {
-                let max = max(acc.clone(), field_val.clone());
-                *acc = max;
+                *acc = max(acc.clone(), field_val.clone());
             }
             AggOp::Min => {
-                let min = min(acc.clone(), field_val.clone());
-                *acc = min;
+                *acc = min(acc.clone(), field_val.clone());
             }
             AggOp::Sum => {
                 *acc = (acc.clone() + field_val.clone())?;
             }
             AggOp::Avg => {
-                *acc = (acc.clone() + field_val.clone())?; // This will be divided by the count later
+                *acc = (acc.clone() + field_val.clone())?;
             }
         }
         Ok(())
     }
 
+    fn place_field(op: AggOp, field_val: &Field) -> Field {
+        match op {
+            AggOp::Count => Field::Int(1),
+            AggOp::Max | AggOp::Min | AggOp::Sum => field_val.clone(),
+            AggOp::Avg => match field_val {
+                Field::Int(v) => f_decimal(*v as f64),
+                Field::Decimal(..) => field_val.clone(),
+                _ => field_val.clone(),
+            },
+        }
+    }
+
+    fn build_internal_ops(&mut self) {
+        self.ops_other.clear();
+        for op in &self.ops {
+            match op {
+                AggOp::Avg => {
+                    self.ops_other.push(AggOp::Avg);
+                    self.ops_other.push(AggOp::Count);
+                }
+                _ => self.ops_other.push(*op),
+            }
+        }
+    }
+
+    fn eval_groupby_fields(&self, tuple: &Tuple) -> Vec<Field> {
+        self.groupby_expr.iter().map(|expr| expr.eval(tuple)).collect()
+    }
+
+    fn eval_internal_agg_fields(&self, tuple: &Tuple) -> Vec<Field> {
+        let mut fields = Vec::new();
+
+        for (expr, op) in self.agg_expr.iter().zip(self.ops.iter()) {
+            let field = expr.eval(tuple);
+            match op {
+                AggOp::Avg => {
+                    let sum_field = match field.clone() {
+                        Field::Int(v) => f_decimal(v as f64),
+                        other => other,
+                    };
+                    fields.push(sum_field);
+                    fields.push(Field::Int(1));
+                }
+                _ => fields.push(field),
+            }
+        }
+
+        fields
+    }
+
     pub fn merge_tuple_into_group(&mut self, tuple: &Tuple) {
-        todo!("Your code here");
+        let groupby_fields = self.eval_groupby_fields(tuple);
+        let agg_fields = self.eval_internal_agg_fields(tuple);
+
+        if let Some(fields) = self.map.get_mut(&groupby_fields) {
+            for i in 0..fields.len() {
+                Self::merge_fields(self.ops_other[i], &agg_fields[i], &mut fields[i]).unwrap();
+            }
+        } else {
+            let mut init_fields = Vec::with_capacity(agg_fields.len());
+            for i in 0..agg_fields.len() {
+                init_fields.push(Self::place_field(self.ops_other[i], &agg_fields[i]));
+            }
+            self.map.insert(groupby_fields, init_fields);
+        }
+    }
+
+    fn materialize_results(&mut self) -> Result<(), CrustyError> {
+        self.results.clear();
+
+        let mut entries: Vec<(Vec<Field>, Vec<Field>)> = self.map.drain().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (group_key, agg_vals) in entries {
+            let mut out_fields = group_key;
+            let mut internal_idx = 0;
+
+            for op in &self.ops {
+                match op {
+                    AggOp::Avg => {
+                        let sum = agg_vals[internal_idx].clone();
+                        let count = agg_vals[internal_idx + 1].clone();
+                        let avg = (sum / count)?;
+                        out_fields.push(avg);
+                        internal_idx += 2;
+                    }
+                    _ => {
+                        out_fields.push(agg_vals[internal_idx].clone());
+                        internal_idx += 1;
+                    }
+                }
+            }
+
+            self.results.push(Tuple::new(out_fields));
+        }
+
+        Ok(())
     }
 }
 
 impl OpIterator for Aggregate {
     fn configure(&mut self, will_rewind: bool) {
         self.will_rewind = will_rewind;
-        self.child.configure(false); // child of a aggregate will never be rewinded
-                                     // because aggregate will buffer all the tuples from the child
+        self.child.configure(false);
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            self.child.open()?;
+            self.open = true;
+            self.index = 0;
+            self.map.clear();
+            self.results.clear();
+
+            self.build_internal_ops();
+
+            while let Some(tuple) = self.child.next()? {
+                self.merge_tuple_into_group(&tuple);
+            }
+
+            self.materialize_results()?;
+        }
+        Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        if self.index < self.results.len() {
+            let t = self.results[self.index].clone();
+            self.index += 1;
+            Ok(Some(t))
+        } else {
+            Ok(None)
+        }
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.child.close()?;
+        self.open = false;
+        self.index = 0;
+        self.map.clear();
+        self.ops_other.clear();
+        self.results.clear();
+        let _ = self.managers;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened")
+        }
+
+        self.index = 0;
+        Ok(())
     }
 
     fn get_schema(&self) -> &TableSchema {
@@ -165,22 +315,10 @@ mod test {
 
         #[test]
         fn test_count() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
             let group_by = vec![colidx_expr(1), colidx_expr(2)];
             let agg = vec![colidx_expr(0)];
             let ops = vec![AggOp::Count];
             let t = run_aggregate(group_by, agg, ops);
-            // Output:
-            // 1 3 2
-            // 1 4 1
-            // 2 4 1
-            // 2 5 2
             assert_eq!(t.len(), 4);
             assert_eq!(t[0], Tuple::new(vec![f_int(1), f_int(3), f_int(2)]));
             assert_eq!(t[1], Tuple::new(vec![f_int(1), f_int(4), f_int(1)]));
@@ -190,23 +328,10 @@ mod test {
 
         #[test]
         fn test_sum() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
-
             let group_by = vec![colidx_expr(1), colidx_expr(2)];
             let agg = vec![colidx_expr(0)];
             let ops = vec![AggOp::Sum];
             let tuples = run_aggregate(group_by, agg, ops);
-            // Output:
-            // 1 3 3
-            // 1 4 3
-            // 2 4 4
-            // 2 5 11
             assert_eq!(tuples.len(), 4);
             assert_eq!(tuples[0], Tuple::new(vec![f_int(1), f_int(3), f_int(3)]));
             assert_eq!(tuples[1], Tuple::new(vec![f_int(1), f_int(4), f_int(3)]));
@@ -216,23 +341,10 @@ mod test {
 
         #[test]
         fn test_max() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
-
             let group_by = vec![colidx_expr(1), colidx_expr(2)];
             let agg = vec![colidx_expr(3)];
             let ops = vec![AggOp::Max];
             let t = run_aggregate(group_by, agg, ops);
-            // Output:
-            // 1 3 G
-            // 1 4 A
-            // 2 4 G
-            // 2 5 G
             assert_eq!(t.len(), 4);
             assert_eq!(t[0], Tuple::new(vec![f_int(1), f_int(3), f_str("G")]));
             assert_eq!(t[1], Tuple::new(vec![f_int(1), f_int(4), f_str("A")]));
@@ -242,23 +354,10 @@ mod test {
 
         #[test]
         fn test_min() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
-
             let group_by = vec![colidx_expr(1), colidx_expr(2)];
             let agg = vec![colidx_expr(3)];
             let ops = vec![AggOp::Min];
             let t = run_aggregate(group_by, agg, ops);
-            // Output:
-            // 1 3 E
-            // 1 4 A
-            // 2 4 G
-            // 2 5 G
             assert!(t.len() == 4);
             assert_eq!(t[0], Tuple::new(vec![f_int(1), f_int(3), f_str("E")]));
             assert_eq!(t[1], Tuple::new(vec![f_int(1), f_int(4), f_str("A")]));
@@ -268,22 +367,10 @@ mod test {
 
         #[test]
         fn test_avg() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
             let group_by = vec![colidx_expr(1), colidx_expr(2)];
             let agg = vec![colidx_expr(0)];
             let ops = vec![AggOp::Avg];
             let t = run_aggregate(group_by, agg, ops);
-            // Output:
-            // 1 3 1.5
-            // 1 4 3.0
-            // 2 4 4.0
-            // 2 5 5.5
             assert_eq!(t.len(), 4);
             assert_eq!(t[0], Tuple::new(vec![f_int(1), f_int(3), f_decimal(1.5)]));
             assert_eq!(t[1], Tuple::new(vec![f_int(1), f_int(4), f_decimal(3.0)]));
@@ -293,21 +380,10 @@ mod test {
 
         #[test]
         fn test_multi_column_aggregation() {
-            // Input:
-            // 1 1 3 E
-            // 2 1 3 G
-            // 3 1 4 A
-            // 4 2 4 G
-            // 5 2 5 G
-            // 6 2 5 G
             let group_by = vec![colidx_expr(3)];
             let agg = vec![colidx_expr(0), colidx_expr(1), colidx_expr(2)];
             let ops = vec![AggOp::Count, AggOp::Max, AggOp::Avg];
             let t = run_aggregate(group_by, agg, ops);
-            // Output:
-            // A 1 1 4.0
-            // E 1 1 3.0
-            // G 4 2 4.25
             assert_eq!(t.len(), 3);
             assert_eq!(
                 t[0],
@@ -366,7 +442,7 @@ mod test {
         #[test]
         fn test_rewind() {
             let mut iter = get_iter(vec![colidx_expr(2)], vec![colidx_expr(0)], vec![AggOp::Max]);
-            iter.configure(true); // if we will rewind in the future, then we set will_rewind to true
+            iter.configure(true);
             let t_before = execute_iter(&mut *iter, true).unwrap();
             iter.rewind().unwrap();
             let t_after = execute_iter(&mut *iter, true).unwrap();
